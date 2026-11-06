@@ -5,7 +5,6 @@ import logging
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-
 DB_URL = "postgresql+psycopg2://postgres:postgres@localhost:5432/deals_bigdata"
 engine = create_engine(DB_URL)
 
@@ -19,10 +18,10 @@ def extract():
 def transform(df_prices, df_rates, df_cities):
     logging.info("Transforming data and applying DQ rules...")
 
-    # 1. Валидация базовых полей
     initial_len = len(df_prices)
     valid_cities = set(df_cities['gc_id'])
 
+    # Базовый DQ
     df_prices = df_prices[
         (df_prices['price'] > 0) &
         (df_prices['distance'] > 0) &
@@ -32,14 +31,12 @@ def transform(df_prices, df_rates, df_cities):
         (df_prices['unloading_city_gcid'].isin(valid_cities))
         ].copy()
 
-    # Для RUB проверяем, что цена не больше 1000 (по условию)
+    # Валидация цены для RUB
     df_prices = df_prices[~((df_prices['currency_code'] == 643) & (df_prices['price'] > 1000))]
 
-    # 2. Конвертация валют
+    # Merge для конвертации валют
     df_prices['nearest_rate_date'] = pd.to_datetime(df_prices['nearest_rate_date'])
     df_rates['setting_date'] = pd.to_datetime(df_rates['setting_date'])
-
-    # Переименовываем 'id' в 'price_id' ДО merge, чтобы избежать конфликта колонок
     df_prices = df_prices.rename(columns={'id': 'price_id'})
 
     df_merged = df_prices.merge(
@@ -49,15 +46,14 @@ def transform(df_prices, df_rates, df_cities):
         how='left'
     )
 
-    # Если курса нет (NaN) и валюта не RUB (643) - удаляем
+    # Отсекаем строки, где нет курса для валюты
     df_merged = df_merged[(df_merged['currency_code'] == 643) | (df_merged['value'].notna())]
 
-    # Пересчет в рубли
     df_merged['price_rub'] = df_merged.apply(
         lambda row: row['price'] if row['currency_code'] == 643 else row['price'] * row['value'], axis=1
     )
 
-    # 3. Весовые и объемные категории
+    # Категоризация
     def get_weight_cat(w):
         if w >= 30: return 'G20T'
         if w >= 10: return 'FTL'
@@ -73,26 +69,23 @@ def transform(df_prices, df_rates, df_cities):
     df_merged['weight_category'] = df_merged['total_weight'].apply(get_weight_cat)
     df_merged['volume_category'] = df_merged['total_volume'].apply(get_vol_cat)
 
-    # Оставляем нужные колонки (теперь используем 'price_id')
     cols = ['price_id', 'loading_date', 'loading_city_gcid', 'unloading_city_gcid',
             'distance', 'total_weight', 'total_volume', 'body_type', 'price_rub',
             'price_type', 'is_fact', 'complex', 'outlier_mark', 'weight_category', 'volume_category']
 
     df_final = df_merged[cols]
-
     logging.info(f"DQ: {initial_len - len(df_final)} rows quarantined/removed.")
     return df_final
 
 def load(df_final):
-    logging.info("Loading to core.fact_prices (Idempotent - truncate & insert)...")
+    logging.info("Loading to core.fact_prices...")
 
-    # МАГИЯ: Заменяем все NaN на None, чтобы база данных поняла, что это NULL
+    # Конвертация NaN в None для совместимости с типами PostgreSQL
     df_final = df_final.astype(object).where(pd.notnull(df_final), None)
 
     with engine.begin() as conn:
         conn.execute(text("TRUNCATE TABLE core.fact_prices"))
 
-    # Добавляем chunksize, чтобы не перегружать память
     df_final.to_sql('fact_prices', engine, schema='core', if_exists='append', index=False, method='multi', chunksize=1000)
     logging.info(f"Loaded {len(df_final)} rows to Core DWH.")
 

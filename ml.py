@@ -8,13 +8,12 @@ import logging
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# ВПИШИ СВОЙ ПАРОЛЬ ОТ POSTGRESQL ВМЕСТО твой_пароль
 DB_URL = "postgresql+psycopg2://postgres:postgres@localhost:5432/deals_bigdata"
 engine = create_engine(DB_URL)
 
 def extract_for_ml():
     logging.info("Extracting data for ML...")
-    # ИСПРАВЛЕНО: Добавлена дедупликация городов через WITH (CTE), чтобы не размножать сделки
+    # Используем ROW_NUMBER для дедупликации справочника городов
     query = """
             WITH dedup_cities AS (
                 SELECT gc_id, full_name_local
@@ -42,10 +41,9 @@ def feature_engineering(df):
     df['loading_region'] = df['loading_city_full'].apply(lambda x: str(x).split(',')[1].strip() if ',' in str(x) else 'Unknown')
     df['unloading_region'] = df['unloading_city_full'].apply(lambda x: str(x).split(',')[1].strip() if ',' in str(x) else 'Unknown')
 
-    # ИСПРАВЛЕНО: Чистое приведение к строке без предупреждений pandas
     df['body_type'] = df['body_type'].apply(lambda x: str(x) if pd.notnull(x) else 'Unknown')
 
-    # ИСПРАВЛЕНО: day_of_week и day_of_year в новых версиях pandas называются с подчеркиваниями
+    # Циклическое кодирование
     df['month'] = df['loading_date'].dt.month
     df['day_of_week'] = df['loading_date'].dt.day_of_week
     df['day_of_year'] = df['loading_date'].dt.day_of_year
@@ -64,13 +62,13 @@ def feature_engineering(df):
 
 def train_and_predict(df, features):
     logging.info("Splitting data...")
+    # Time-based split
     train_mask = (df['loading_date'] >= '2026-07-26') & (df['loading_date'] < '2026-10-05')
     test_mask = (df['loading_date'] >= '2026-10-05') & (df['loading_date'] <= '2026-10-26')
     future_mask = (df['loading_date'] > '2026-10-26')
 
     train = df[train_mask]
     test = df[test_mask]
-
     cat_features = ['loading_region', 'unloading_region', 'body_type']
 
     logging.info("Training CatBoost model...")
@@ -86,7 +84,7 @@ def train_and_predict(df, features):
 
     logging.info(f"MODEL METRICS: R2={r2:.4f}, MAPE={mape*100:.2f}%, RMSE={rmse:.2f}, MAE={mae:.2f}")
 
-    logging.info("Batch Prediction for test and future...")
+    logging.info("Batch Prediction...")
     predict_mask = test_mask | future_mask
     predict_df = df[predict_mask].copy()
     predict_df['predicted_price_rub'] = model.predict(predict_df[features])
@@ -94,15 +92,15 @@ def train_and_predict(df, features):
     result = predict_df[['price_id', 'loading_date', 'loading_city_gcid', 'unloading_city_gcid', 'body_type', 'price_rub', 'predicted_price_rub']]
     result = result.rename(columns={'price_rub': 'actual_price_rub', 'body_type': 'body_group'})
 
+    # Для будущих заявок факта нет
     result.loc[result['loading_date'] > '2026-10-26', ['actual_price_rub']] = None
 
     result['abs_error_rub'] = abs(result['actual_price_rub'] - result['predicted_price_rub'])
     result['ape_pct'] = (result['abs_error_rub'] / result['actual_price_rub']) * 100
     result['model_name'] = 'CatBoost_v1'
 
-    # Защита от дублей (на всякий случай)
+    # Защита от дублей
     result = result.drop_duplicates(subset=['price_id'])
-
     return result
 
 def load_predictions(result):
